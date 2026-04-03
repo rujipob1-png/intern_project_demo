@@ -1,0 +1,1470 @@
+import { supabaseAdmin } from '../config/supabase.js';
+import { successResponse, errorResponse } from '../utils/response.js';
+import { HTTP_STATUS } from '../config/constants.js';
+import { createNotification } from './notification.controller.js';
+import { EmailService } from '../utils/emailService.js';
+import { parseLeaveReason, parseSelectedDates } from '../utils/parseReason.js';
+
+/**
+ * ดูรายการคำขอลาที่รออนุมัติ (Central Office Staff - Level 2)
+ * ดูคำขอที่ผ่านการอนุมัติจาก Director แล้ว (approved_level1)
+ */
+export const getPendingLeavesStaff = async (req, res) => {
+  try {
+    // ดึงคำขอลาที่อยู่ในสถานะ approved_level1
+    const { data: leaves, error } = await supabaseAdmin
+      .from('leaves')
+      .select(`
+        *,
+        leave_types (
+          type_name,
+          type_code
+        ),
+        users!leaves_user_id_fkey (
+          id,
+          employee_code,
+          title,
+          first_name,
+          last_name,
+          position,
+          department,
+          phone
+        )
+      `)
+      .eq('status', 'approved_level1')
+      .order('updated_at', { ascending: true });
+
+    if (error) {
+      throw error;
+    }
+
+    // ดึงข้อมูลการอนุมัติ level 1 ใน 1 query (แก้ N+1)
+    const staffLeaveIds = leaves.map(l => l.id);
+    const { data: level1Approvals } = staffLeaveIds.length > 0
+      ? await supabaseAdmin
+          .from('approvals')
+          .select(`
+            *,
+            approver:users!approvals_approver_id_fkey (
+              title,
+              first_name,
+              last_name
+            )
+          `)
+          .in('leave_id', staffLeaveIds)
+          .eq('approval_level', 1)
+      : { data: [] };
+
+    const staffApprovalMap = {};
+    (level1Approvals || []).forEach(a => {
+      staffApprovalMap[a.leave_id] = a;
+    });
+
+    const leavesWithApprovals = leaves.map(leave => ({
+      ...leave,
+      level1Approval: staffApprovalMap[leave.id] || null
+    }));
+
+    return successResponse(
+      res,
+      HTTP_STATUS.OK,
+      'Pending leaves for staff review retrieved successfully',
+      leavesWithApprovals.map(leave => {
+        // ตรวจสอบว่าเป็น user ที่ข้าม Director มาหรือไม่ (กอง GOK/กองอำนวยการ)
+        const isGOKDepartment = leave.users?.department === 'GOK' || leave.users?.department === 'กองอำนวยการ';
+        const skippedDirector = isGOKDepartment && !leave.level1Approval;
+
+        return {
+          id: leave.id,
+          leaveNumber: leave.leave_number,
+          leaveType: leave.leave_types?.type_name || 'N/A',
+          leaveTypeCode: leave.leave_types?.type_code || 'N/A',
+          startDate: leave.start_date,
+          endDate: leave.end_date,
+          totalDays: leave.total_days,
+          reason: parseLeaveReason(leave.reason),
+          documentUrl: leave.document_url,
+          contactAddress: leave.contact_address,
+          contactPhone: leave.contact_phone,
+          selectedDates: parseSelectedDates(leave.reason, leave.selected_dates),
+          createdAt: leave.created_at,
+          employee: {
+            employeeCode: leave.users?.employee_code,
+            name: `${leave.users?.title || ''}${leave.users?.first_name || ''} ${leave.users?.last_name || ''}`,
+            position: leave.users?.position,
+            department: leave.users?.department || 'N/A',
+            phone: leave.users?.phone
+          },
+          skippedDirector, // flag บอกว่าข้าม Director มา (ชั้น 3)
+          directorApproval: skippedDirector ? null : {
+            approvedAt: leave.level1Approval?.action_date,
+            remarks: leave.level1Approval?.comment,
+            approver: leave.level1Approval?.approver 
+              ? `${leave.level1Approval.approver.title}${leave.level1Approval.approver.first_name} ${leave.level1Approval.approver.last_name}` 
+              : null
+          }
+        };
+      })
+    );
+  } catch (error) {
+    console.error('Get pending leaves (staff) error:', error);
+    return errorResponse(
+      res,
+      HTTP_STATUS.INTERNAL_SERVER_ERROR,
+      'Failed to retrieve pending leaves'
+    );
+  }
+};
+
+/**
+ * อนุมัติคำขอลา (Central Office Staff - Level 2)
+ */
+export const approveLeavLevel2 = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { remarks } = req.body;
+    const staffId = req.user.id;
+
+    // ตรวจสอบว่ามีคำขอลานี้หรือไม่
+    const { data: leave, error: fetchError } = await supabaseAdmin
+      .from('leaves')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (fetchError || !leave) {
+      return errorResponse(
+        res,
+        HTTP_STATUS.NOT_FOUND,
+        'Leave request not found'
+      );
+    }
+
+    // ตรวจสอบสถานะ - ต้องเป็น approved_level1
+    if (leave.status !== 'approved_level1') {
+      return errorResponse(
+        res,
+        HTTP_STATUS.BAD_REQUEST,
+        'This leave request is not ready for staff approval'
+      );
+    }
+
+    // อัพเดทสถานะเป็น approved_level2
+    const { error: updateError } = await supabaseAdmin
+      .from('leaves')
+      .update({
+        status: 'approved_level2',
+        current_approval_level: 3,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', id);
+
+    if (updateError) {
+      throw updateError;
+    }
+
+    // บันทึกการอนุมัติใน approvals table
+    const { error: approvalError } = await supabaseAdmin
+      .from('approvals')
+      .insert({
+        leave_id: id,
+        approver_id: staffId,
+        approval_level: 2,
+        action: 'approved',
+        comment: remarks || 'เอกสารถูกต้อง ครบถ้วน',
+        action_date: new Date().toISOString()
+      });
+
+    if (approvalError) {
+      console.error('Error inserting approval record:', approvalError);
+    }
+
+    // ส่งแจ้งเตือนให้ผู้ขอลา
+    await createNotification(
+      leave.user_id,
+      'leave_approved',
+      'คำขอลาผ่านการตรวจสอบเอกสาร',
+      `คำขอลาเลขที่ ${leave.leave_number} ผ่านการตรวจสอบเอกสารจากเจ้าหน้าที่แล้ว รอการอนุมัติระดับถัดไป`,
+      id,
+      'leave'
+    );
+
+    // ส่ง email แจ้งผู้ขอลาว่าอนุมัติระดับ 2 แล้ว
+    EmailService.notifyStatusUpdate(id, 'approved_level2', {
+      approverName: (req.user.title || '') + req.user.firstName + ' ' + req.user.lastName + (req.user.position ? ' (' + req.user.position + ')' : ''),
+      comment: remarks || 'อนุมัติ'
+    }).catch(err => {
+      console.error('Email notification error:', err.message);
+    });
+
+    // ส่งแจ้งเตือนให้ central_office_head (ผอ.กอก.)
+    const { data: headRole } = await supabaseAdmin
+      .from('roles')
+      .select('id')
+      .eq('role_name', 'central_office_head')
+      .single();
+
+    if (headRole) {
+      const { data: headUsers } = await supabaseAdmin
+        .from('users')
+        .select('id')
+        .eq('role_id', headRole.id);
+
+      if (headUsers && headUsers.length > 0) {
+        for (const head of headUsers) {
+          await createNotification(
+            head.id,
+            'leave_pending',
+            'มีคำขอลาใหม่รออนุมัติ',
+            `คำขอลาเลขที่ ${leave.leave_number} ผ่านการตรวจสอบเอกสารแล้ว รอการอนุมัติจากท่าน`,
+            id,
+            'leave'
+          );
+        }
+      }
+    }
+
+    // ส่ง email แจ้งเตือน central_office_head ทุกคน
+    EmailService.notifyApprovers(id, 'central_office_head').catch(err => {
+      console.error('Email notification to central_office_head error:', err.message);
+    });
+
+    return successResponse(
+      res,
+      HTTP_STATUS.OK,
+      'Leave approved successfully and forwarded to Central Office Head',
+      {
+        leaveId: id,
+        status: 'approved_level2',
+        nextLevel: 'Central Office Head'
+      }
+    );
+  } catch (error) {
+    console.error('Approve leave (level 2) error:', error);
+    return errorResponse(
+      res,
+      HTTP_STATUS.INTERNAL_SERVER_ERROR,
+      'Failed to approve leave'
+    );
+  }
+};
+
+/**
+ * ปฏิเสธคำขอลา (Central Office Staff - Level 2)
+ */
+export const rejectLeaveLevel2 = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { remarks } = req.body;
+    const staffId = req.user.id;
+
+    if (!remarks) {
+      return errorResponse(
+        res,
+        HTTP_STATUS.BAD_REQUEST,
+        'Rejection remarks are required'
+      );
+    }
+
+    // ตรวจสอบว่ามีคำขอลานี้หรือไม่
+    const { data: leave, error: fetchError } = await supabaseAdmin
+      .from('leaves')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (fetchError || !leave) {
+      return errorResponse(
+        res,
+        HTTP_STATUS.NOT_FOUND,
+        'Leave request not found'
+      );
+    }
+
+    // ตรวจสอบสถานะ - ต้องเป็น approved_level1
+    if (leave.status !== 'approved_level1') {
+      return errorResponse(
+        res,
+        HTTP_STATUS.BAD_REQUEST,
+        'This leave request is not ready for staff review'
+      );
+    }
+
+    // อัพเดทสถานะเป็น rejected
+    const { error: updateError } = await supabaseAdmin
+      .from('leaves')
+      .update({
+        status: 'rejected',
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', id);
+
+    if (updateError) {
+      throw updateError;
+    }
+
+    // บันทึกการปฏิเสธใน approvals table
+    const { error: approvalError } = await supabaseAdmin
+      .from('approvals')
+      .insert({
+        leave_id: id,
+        approver_id: staffId,
+        approval_level: 2,
+        action: 'rejected',
+        comment: remarks,
+        action_date: new Date().toISOString()
+      });
+
+    if (approvalError) {
+      console.error('Error inserting approval record:', approvalError);
+    }
+
+    // ส่งแจ้งเตือนให้ผู้ขอลา
+    await createNotification(
+      leave.user_id,
+      'leave_rejected',
+      'คำขอลาไม่ผ่านการตรวจสอบ',
+      `คำขอลาเลขที่ ${leave.leave_number} ไม่ผ่านการตรวจสอบเอกสารจากเจ้าหน้าที่ เหตุผล: ${remarks}`,
+      id,
+      'leave'
+    );
+
+    // ส่ง email แจ้งผู้ขอลาว่าถูกปฏิเสธ
+    EmailService.notifyStatusUpdate(id, 'rejected', {
+      approverName: (req.user.title || '') + req.user.firstName + ' ' + req.user.lastName + (req.user.position ? ' (' + req.user.position + ')' : ''),
+      comment: remarks
+    }).catch(err => {
+      console.error('Email notification error:', err.message);
+    });
+
+    return successResponse(
+      res,
+      HTTP_STATUS.OK,
+      'Leave rejected successfully',
+      {
+        leaveId: id,
+        status: 'rejected',
+        remarks
+      }
+    );
+  } catch (error) {
+    console.error('Reject leave (level 2) error:', error);
+    return errorResponse(
+      res,
+      HTTP_STATUS.INTERNAL_SERVER_ERROR,
+      'Failed to reject leave'
+    );
+  }
+};
+
+/**
+ * ดูรายการคำขอลาที่รออนุมัติ (Central Office Head - Level 3)
+ * ดูคำขอที่ผ่านการอนุมัติจาก Staff แล้ว (approved_level2)
+ */
+export const getPendingLeavesHead = async (req, res) => {
+  try {
+    // ดึงคำขอลาที่อยู่ในสถานะ approved_level2
+    const { data: leaves, error } = await supabaseAdmin
+      .from('leaves')
+      .select(`
+        *,
+        leave_types (
+          type_name,
+          type_code
+        ),
+        users!leaves_user_id_fkey (
+          id,
+          employee_code,
+          title,
+          first_name,
+          last_name,
+          position,
+          department,
+          phone
+        )
+      `)
+      .eq('status', 'approved_level2')
+      .order('updated_at', { ascending: true });
+
+    if (error) {
+      throw error;
+    }
+
+    // ดึงข้อมูลการอนุมัติ level 1-2 ใน 1 query (แก้ N+1)
+    const headLeaveIds = leaves.map(l => l.id);
+    const { data: headApprovals } = headLeaveIds.length > 0
+      ? await supabaseAdmin
+          .from('approvals')
+          .select(`
+            *,
+            approver:users!approvals_approver_id_fkey (
+              title,
+              first_name,
+              last_name
+            )
+          `)
+          .in('leave_id', headLeaveIds)
+          .in('approval_level', [1, 2])
+      : { data: [] };
+
+    const headApprovalMap = {};
+    (headApprovals || []).forEach(a => {
+      if (!headApprovalMap[a.leave_id]) headApprovalMap[a.leave_id] = {};
+      headApprovalMap[a.leave_id][a.approval_level] = a;
+    });
+
+    const leavesWithApprovals = leaves.map(leave => ({
+      ...leave,
+      level1Approval: headApprovalMap[leave.id]?.[1] || null,
+      level2Approval: headApprovalMap[leave.id]?.[2] || null
+    }));
+
+    return successResponse(
+      res,
+      HTTP_STATUS.OK,
+      'Pending leaves for head review retrieved successfully',
+      leavesWithApprovals.map(leave => ({
+        id: leave.id,
+        leaveNumber: leave.leave_number,
+        leaveType: leave.leave_types?.type_name || 'N/A',
+        leaveTypeCode: leave.leave_types?.type_code || 'N/A',
+        startDate: leave.start_date,
+        endDate: leave.end_date,
+        totalDays: leave.total_days,
+        reason: parseLeaveReason(leave.reason),
+        documentUrl: leave.document_url,
+        selectedDates: parseSelectedDates(leave.reason, leave.selected_dates),
+        createdAt: leave.created_at,
+        employee: {
+          employeeCode: leave.users?.employee_code,
+          name: `${leave.users?.title || ''}${leave.users?.first_name || ''} ${leave.users?.last_name || ''}`,
+          position: leave.users?.position,
+          department: leave.users?.department || 'N/A'
+        },
+        approvalHistory: {
+          director: {
+            approvedAt: leave.level1Approval?.action_date,
+            remarks: leave.level1Approval?.comment,
+            approver: leave.level1Approval?.approver 
+              ? `${leave.level1Approval.approver.title}${leave.level1Approval.approver.first_name} ${leave.level1Approval.approver.last_name}` 
+              : null
+          },
+          staff: {
+            approvedAt: leave.level2Approval?.action_date,
+            remarks: leave.level2Approval?.comment,
+            approver: leave.level2Approval?.approver 
+              ? `${leave.level2Approval.approver.title}${leave.level2Approval.approver.first_name} ${leave.level2Approval.approver.last_name}` 
+              : null
+          }
+        }
+      }))
+    );
+  } catch (error) {
+    console.error('Get pending leaves (head) error:', error);
+    return errorResponse(
+      res,
+      HTTP_STATUS.INTERNAL_SERVER_ERROR,
+      'Failed to retrieve pending leaves'
+    );
+  }
+};
+
+/**
+ * อนุมัติคำขอลา (Central Office Head - Level 3)
+ */
+export const approveLeaveLevel3 = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { remarks } = req.body;
+    const headId = req.user.id;
+
+    // ตรวจสอบว่ามีคำขอลานี้หรือไม่
+    const { data: leave, error: fetchError } = await supabaseAdmin
+      .from('leaves')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (fetchError || !leave) {
+      return errorResponse(
+        res,
+        HTTP_STATUS.NOT_FOUND,
+        'Leave request not found'
+      );
+    }
+
+    // ตรวจสอบสถานะ - ต้องเป็น approved_level2
+    if (leave.status !== 'approved_level2') {
+      return errorResponse(
+        res,
+        HTTP_STATUS.BAD_REQUEST,
+        'This leave request is not ready for head approval'
+      );
+    }
+
+    // อัพเดทสถานะเป็น approved_level3
+    const { error: updateError } = await supabaseAdmin
+      .from('leaves')
+      .update({
+        status: 'approved_level3',
+        current_approval_level: 4,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', id);
+
+    if (updateError) {
+      throw updateError;
+    }
+
+    // บันทึกการอนุมัติใน approvals table
+    const { error: approvalError } = await supabaseAdmin
+      .from('approvals')
+      .insert({
+        leave_id: id,
+        approver_id: headId,
+        approval_level: 3,
+        action: 'approved',
+        comment: remarks || 'อนุมัติ',
+        action_date: new Date().toISOString()
+      });
+
+    if (approvalError) {
+      console.error('Error inserting approval record:', approvalError);
+    }
+
+    // ส่งแจ้งเตือนให้ผู้ขอลา
+    await createNotification(
+      leave.user_id,
+      'leave_approved',
+      'คำขอลาได้รับการอนุมัติระดับ 3',
+      `คำขอลาเลขที่ ${leave.leave_number} ได้รับการอนุมัติจากหัวหน้าสำนักงานกลางแล้ว รอการอนุมัติขั้นสุดท้าย`,
+      id,
+      'leave'
+    );
+
+    // ส่ง email แจ้งผู้ขอลาว่าอนุมัติระดับ 3 แล้ว
+    EmailService.notifyStatusUpdate(id, 'approved_level3', {
+      approverName: (req.user.title || '') + req.user.firstName + ' ' + req.user.lastName + (req.user.position ? ' (' + req.user.position + ')' : ''),
+      comment: remarks || 'อนุมัติ'
+    }).catch(err => {
+      console.error('Email notification error:', err.message);
+    });
+
+    // ส่งแจ้งเตือนให้ admin (ผู้บริหารสูงสุด)
+    const { data: adminRole } = await supabaseAdmin
+      .from('roles')
+      .select('id')
+      .eq('role_name', 'admin')
+      .single();
+
+    if (adminRole) {
+      const { data: adminUsers } = await supabaseAdmin
+        .from('users')
+        .select('id')
+        .eq('role_id', adminRole.id);
+
+      if (adminUsers && adminUsers.length > 0) {
+        for (const admin of adminUsers) {
+          await createNotification(
+            admin.id,
+            'leave_pending',
+            'มีคำขอลาใหม่รออนุมัติขั้นสุดท้าย',
+            `คำขอลาเลขที่ ${leave.leave_number} ผ่านการอนุมัติระดับ 3 แล้ว รอการอนุมัติขั้นสุดท้ายจากท่าน`,
+            id,
+            'leave'
+          );
+        }
+      }
+    }
+
+    // ส่ง email แจ้งเตือน admin ทุกคน
+    EmailService.notifyApprovers(id, 'admin').catch(err => {
+      console.error('Email notification to admin error:', err.message);
+    });
+
+    return successResponse(
+      res,
+      HTTP_STATUS.OK,
+      'Leave approved successfully and forwarded to Admin',
+      {
+        leaveId: id,
+        status: 'approved_level3',
+        nextLevel: 'Admin (Final Approval)'
+      }
+    );
+  } catch (error) {
+    console.error('Approve leave (level 3) error:', error);
+    return errorResponse(
+      res,
+      HTTP_STATUS.INTERNAL_SERVER_ERROR,
+      'Failed to approve leave'
+    );
+  }
+};
+
+/**
+ * ปฏิเสธคำขอลา (Central Office Head - Level 3)
+ */
+export const rejectLeaveLevel3 = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { remarks } = req.body;
+    const headId = req.user.id;
+
+    if (!remarks) {
+      return errorResponse(
+        res,
+        HTTP_STATUS.BAD_REQUEST,
+        'Rejection remarks are required'
+      );
+    }
+
+    // ตรวจสอบว่ามีคำขอลานี้หรือไม่
+    const { data: leave, error: fetchError } = await supabaseAdmin
+      .from('leaves')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (fetchError || !leave) {
+      return errorResponse(
+        res,
+        HTTP_STATUS.NOT_FOUND,
+        'Leave request not found'
+      );
+    }
+
+    // ตรวจสอบสถานะ - ต้องเป็น approved_level2
+    if (leave.status !== 'approved_level2') {
+      return errorResponse(
+        res,
+        HTTP_STATUS.BAD_REQUEST,
+        'This leave request is not ready for head review'
+      );
+    }
+
+    // อัพเดทสถานะเป็น rejected
+    const { error: updateError } = await supabaseAdmin
+      .from('leaves')
+      .update({
+        status: 'rejected',
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', id);
+
+    if (updateError) {
+      throw updateError;
+    }
+
+    // บันทึกการปฏิเสธใน approvals table
+    const { error: approvalError } = await supabaseAdmin
+      .from('approvals')
+      .insert({
+        leave_id: id,
+        approver_id: headId,
+        approval_level: 3,
+        action: 'rejected',
+        comment: remarks,
+        action_date: new Date().toISOString()
+      });
+
+    if (approvalError) {
+      console.error('Error inserting approval record:', approvalError);
+    }
+
+    // ส่งแจ้งเตือนไปยังผู้ยื่นใบลา
+    await createNotification(
+      leave.user_id,
+      'leave_rejected',
+      'คำขอลาถูกปฏิเสธ',
+      `คำขอลาเลขที่ ${leave.leave_number} ถูกปฏิเสธจากหัวหน้าสำนักงานกลาง เหตุผล: ${remarks}`,
+      id,
+      'leave'
+    );
+
+    // ส่ง email แจ้งผู้ขอลาว่าถูกปฏิเสธ
+    EmailService.notifyStatusUpdate(id, 'rejected', {
+      approverName: (req.user.title || '') + req.user.firstName + ' ' + req.user.lastName + (req.user.position ? ' (' + req.user.position + ')' : ''),
+      comment: remarks
+    }).catch(err => {
+      console.error('Email notification error:', err.message);
+    });
+
+    return successResponse(
+      res,
+      HTTP_STATUS.OK,
+      'Leave rejected successfully',
+      {
+        leaveId: id,
+        status: 'rejected',
+        remarks
+      }
+    );
+  } catch (error) {
+    console.error('Reject leave (level 3) error:', error);
+    return errorResponse(
+      res,
+      HTTP_STATUS.INTERNAL_SERVER_ERROR,
+      'Failed to reject leave'
+    );
+  }
+};
+
+// ==================== CANCEL REQUEST FUNCTIONS ====================
+
+/**
+ * ดูรายการคำขอยกเลิกที่รออนุมัติ (Staff - Level 2)
+ * ดูคำขอที่ผ่านการอนุมัติจาก Director แล้ว (cancel_level1)
+ */
+export const getPendingCancelRequestsStaff = async (req, res) => {
+  try {
+    const { data: leaves, error } = await supabaseAdmin
+      .from('leaves')
+      .select(`
+        *,
+        leave_types (type_name, type_code),
+        users!leaves_user_id_fkey (
+          id, employee_code, title, first_name, last_name, position, department, phone
+        )
+      `)
+      .eq('status', 'cancel_level1')
+      .order('updated_at', { ascending: true });
+
+    if (error) throw error;
+
+    return successResponse(res, HTTP_STATUS.OK, 'Pending cancel requests for staff retrieved',
+      leaves.map(leave => ({
+        id: leave.id,
+        leaveNumber: leave.leave_number,
+        leaveType: leave.leave_types?.type_name || 'N/A',
+        startDate: leave.start_date,
+        endDate: leave.end_date,
+        totalDays: leave.total_days,
+        reason: parseLeaveReason(leave.reason),
+        cancelledReason: leave.cancelled_reason,
+        employee: {
+          employeeCode: leave.users?.employee_code,
+          name: `${leave.users?.title || ''}${leave.users?.first_name || ''} ${leave.users?.last_name || ''}`,
+          position: leave.users?.position,
+          department: leave.users?.department || 'N/A',
+          phone: leave.users?.phone
+        }
+      }))
+    );
+  } catch (error) {
+    console.error('Get pending cancel requests (staff) error:', error);
+    return errorResponse(res, HTTP_STATUS.INTERNAL_SERVER_ERROR, 'Failed to retrieve cancel requests');
+  }
+};
+
+/**
+ * อนุมัติคำขอยกเลิก (Staff - Level 2)
+ */
+export const approveCancelLevel2 = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { remarks } = req.body;
+    const staffId = req.user.id;
+
+    const { data: leave, error: fetchError } = await supabaseAdmin
+      .from('leaves')
+      .select('*')
+      .eq('id', id)
+      .eq('status', 'cancel_level1')
+      .single();
+
+    if (fetchError || !leave) {
+      return errorResponse(res, HTTP_STATUS.NOT_FOUND, 'Cancel request not found');
+    }
+
+    // อัพเดทสถานะเป็น cancel_level2
+    await supabaseAdmin
+      .from('leaves')
+      .update({ status: 'cancel_level2', updated_at: new Date().toISOString() })
+      .eq('id', id);
+
+    // บันทึกการอนุมัติ
+    await supabaseAdmin.from('approvals').insert({
+      leave_id: id,
+      approver_id: staffId,
+      approval_level: 2,
+      action: 'cancel_approved',
+      comment: remarks || 'ตรวจสอบแล้ว ยืนยันการยกเลิกใบลา',
+      action_date: new Date().toISOString()
+    });
+
+    // แจ้ง central_office_head
+    try {
+      const { data: heads } = await supabaseAdmin
+        .from('users')
+        .select('id, roles!inner(role_name)')
+        .eq('roles.role_name', 'central_office_head');
+
+      if (heads && heads.length > 0) {
+        for (const head of heads) {
+          await createNotification(
+            head.id,
+            'cancel_pending',
+            'คำขอยกเลิกการลารอการอนุมัติ',
+            `มีคำขอยกเลิกการลา ${leave.leave_number} รอการอนุมัติ`,
+            id,
+            'leave'
+          );
+        }
+      }
+    } catch (notifError) {
+      console.log('Head cancel notification skipped:', notifError.message);
+    }
+
+    // แจ้งผู้ขอลาว่าคำขอยกเลิกถูกส่งต่อแล้ว
+    await createNotification(
+      leave.user_id,
+      'cancel_pending',
+      'คำขอยกเลิกผ่านระดับ 2',
+      `คำขอยกเลิก ${leave.leave_number} ผ่านการตรวจสอบแล้ว ส่งต่อไประดับ 3`,
+      id,
+      'leave'
+    );
+
+    // ส่ง email แจ้ง user ว่าคำขอยกเลิกผ่านระดับ 2
+    EmailService.notifyStatusUpdate(id, 'cancel_level2').catch(err => {
+      console.error('Email notification (cancel_level2) error:', err.message);
+    });
+
+    // ส่ง email แจ้ง central_office_head ว่ามีคำขอยกเลิกรออนุมัติ
+    EmailService.notifyCancelRequestToApprovers(id, 'central_office_head').catch(err => {
+      console.error('Email notification to central_office_head (cancel) error:', err.message);
+    });
+
+    return successResponse(res, HTTP_STATUS.OK, 'Cancel request approved at level 2');
+  } catch (error) {
+    console.error('Approve cancel (level 2) error:', error);
+    return errorResponse(res, HTTP_STATUS.INTERNAL_SERVER_ERROR, 'Failed to approve cancel');
+  }
+};
+
+/**
+ * ปฏิเสธคำขอยกเลิก (Staff - Level 2)
+ */
+export const rejectCancelLevel2 = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { remarks } = req.body;
+    const staffId = req.user.id;
+
+    if (!remarks?.trim()) {
+      return errorResponse(res, HTTP_STATUS.BAD_REQUEST, 'Rejection reason is required');
+    }
+
+    const { data: leave } = await supabaseAdmin
+      .from('leaves')
+      .select('*')
+      .eq('id', id)
+      .eq('status', 'cancel_level1')
+      .single();
+
+    if (!leave) {
+      return errorResponse(res, HTTP_STATUS.NOT_FOUND, 'Cancel request not found');
+    }
+
+    // คืนสถานะกลับเป็น approved_final
+    await supabaseAdmin
+      .from('leaves')
+      .update({ status: 'approved_final', updated_at: new Date().toISOString() })
+      .eq('id', id);
+
+    await supabaseAdmin.from('approvals').insert({
+      leave_id: id,
+      approver_id: staffId,
+      approval_level: 2,
+      action: 'cancel_rejected',
+      comment: remarks,
+      action_date: new Date().toISOString()
+    });
+
+    // แจ้งผู้ขอลาว่าคำขอยกเลิกถูกปฏิเสธ
+    await createNotification(
+      leave.user_id,
+      'cancel_rejected',
+      'คำขอยกเลิกการลาถูกปฏิเสธ',
+      `คำขอยกเลิก ${leave.leave_number} ถูกปฏิเสธ: ${remarks}`,
+      id,
+      'leave'
+    );
+
+    // ส่ง email แจ้ง user ว่าคำขอยกเลิกถูกปฏิเสธ
+    EmailService.notifyStatusUpdate(id, 'cancel_rejected', {
+      comment: remarks
+    }).catch(err => {
+      console.error('Email notification (cancel_rejected L2) error:', err.message);
+    });
+
+    return successResponse(res, HTTP_STATUS.OK, 'Cancel request rejected');
+  } catch (error) {
+    console.error('Reject cancel (level 2) error:', error);
+    return errorResponse(res, HTTP_STATUS.INTERNAL_SERVER_ERROR, 'Failed to reject cancel');
+  }
+};
+
+/**
+ * ดูรายการคำขอยกเลิกที่รออนุมัติ (Head - Level 3)
+ */
+export const getPendingCancelRequestsHead = async (req, res) => {
+  try {
+    const { data: leaves, error } = await supabaseAdmin
+      .from('leaves')
+      .select(`
+        *,
+        leave_types (type_name, type_code),
+        users!leaves_user_id_fkey (
+          id, employee_code, title, first_name, last_name, position, department, phone
+        )
+      `)
+      .eq('status', 'cancel_level2')
+      .order('updated_at', { ascending: true });
+
+    if (error) throw error;
+
+    return successResponse(res, HTTP_STATUS.OK, 'Pending cancel requests for head retrieved',
+      leaves.map(leave => ({
+        id: leave.id,
+        leaveNumber: leave.leave_number,
+        leaveType: leave.leave_types?.type_name || 'N/A',
+        startDate: leave.start_date,
+        endDate: leave.end_date,
+        totalDays: leave.total_days,
+        reason: parseLeaveReason(leave.reason),
+        cancelledReason: leave.cancelled_reason,
+        employee: {
+          employeeCode: leave.users?.employee_code,
+          name: `${leave.users?.title || ''}${leave.users?.first_name || ''} ${leave.users?.last_name || ''}`,
+          position: leave.users?.position,
+          department: leave.users?.department || 'N/A',
+          phone: leave.users?.phone
+        }
+      }))
+    );
+  } catch (error) {
+    console.error('Get pending cancel requests (head) error:', error);
+    return errorResponse(res, HTTP_STATUS.INTERNAL_SERVER_ERROR, 'Failed to retrieve cancel requests');
+  }
+};
+
+/**
+ * อนุมัติคำขอยกเลิก (Head - Level 3)
+ */
+export const approveCancelLevel3 = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { remarks } = req.body;
+    const headId = req.user.id;
+
+    const { data: leave } = await supabaseAdmin
+      .from('leaves')
+      .select('*')
+      .eq('id', id)
+      .eq('status', 'cancel_level2')
+      .single();
+
+    if (!leave) {
+      return errorResponse(res, HTTP_STATUS.NOT_FOUND, 'Cancel request not found');
+    }
+
+    // อัพเดทสถานะเป็น cancel_level3
+    await supabaseAdmin
+      .from('leaves')
+      .update({ status: 'cancel_level3', updated_at: new Date().toISOString() })
+      .eq('id', id);
+
+    await supabaseAdmin.from('approvals').insert({
+      leave_id: id,
+      approver_id: headId,
+      approval_level: 3,
+      action: 'cancel_approved',
+      comment: remarks || 'ยืนยันการยกเลิกใบลา',
+      action_date: new Date().toISOString()
+    });
+
+    // แจ้ง admin
+    try {
+      const { data: admins } = await supabaseAdmin
+        .from('users')
+        .select('id, roles!inner(role_name)')
+        .eq('roles.role_name', 'admin');
+
+      if (admins && admins.length > 0) {
+        for (const admin of admins) {
+          await createNotification(
+            admin.id,
+            'cancel_pending',
+            'คำขอยกเลิกการลารออนุมัติขั้นสุดท้าย',
+            `มีคำขอยกเลิกการลา ${leave.leave_number} รออนุมัติขั้นสุดท้าย`,
+            id,
+            'leave'
+          );
+        }
+      }
+    } catch (notifError) {
+      console.log('Admin cancel notification skipped:', notifError.message);
+    }
+
+    // แจ้งผู้ขอลาว่าคำขอยกเลิกถูกส่งต่อแล้ว
+    await createNotification(
+      leave.user_id,
+      'cancel_pending',
+      'คำขอยกเลิกผ่านระดับ 3',
+      `คำขอยกเลิก ${leave.leave_number} ผ่านการอนุมัติระดับ 3 แล้ว รออนุมัติขั้นสุดท้าย`,
+      id,
+      'leave'
+    );
+
+    // ส่ง email แจ้ง user ว่าคำขอยกเลิกผ่านระดับ 3
+    EmailService.notifyStatusUpdate(id, 'cancel_level3').catch(err => {
+      console.error('Email notification (cancel_level3) error:', err.message);
+    });
+
+    // ส่ง email แจ้ง admin ว่ามีคำขอยกเลิกรออนุมัติขั้นสุดท้าย
+    EmailService.notifyCancelRequestToApprovers(id, 'admin').catch(err => {
+      console.error('Email notification to admin (cancel) error:', err.message);
+    });
+
+    return successResponse(res, HTTP_STATUS.OK, 'Cancel request approved at level 3');
+  } catch (error) {
+    console.error('Approve cancel (level 3) error:', error);
+    return errorResponse(res, HTTP_STATUS.INTERNAL_SERVER_ERROR, 'Failed to approve cancel');
+  }
+};
+
+/**
+ * อนุมัติบางวัน (Partial Approval) - Head Level 3
+ * สามารถเลือกอนุมัติบางวันและปฏิเสธบางวันได้
+ */
+export const partialApproveLeaveLevel3 = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { approvedDates, rejectedDates, rejectReason, remarks } = req.body;
+    const headId = req.user.id;
+
+    if (!approvedDates || approvedDates.length === 0) {
+      return errorResponse(
+        res,
+        HTTP_STATUS.BAD_REQUEST,
+        'ต้องมีอย่างน้อย 1 วันที่อนุมัติ'
+      );
+    }
+
+    if (rejectedDates && rejectedDates.length > 0 && !rejectReason) {
+      return errorResponse(
+        res,
+        HTTP_STATUS.BAD_REQUEST,
+        'ต้องระบุเหตุผลสำหรับวันที่ไม่อนุมัติ'
+      );
+    }
+
+    // ตรวจสอบว่ามีคำขอลานี้หรือไม่
+    const { data: leave, error: fetchError } = await supabaseAdmin
+      .from('leaves')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (fetchError || !leave) {
+      return errorResponse(
+        res,
+        HTTP_STATUS.NOT_FOUND,
+        'Leave request not found'
+      );
+    }
+
+    // ตรวจสอบสถานะ - ต้องเป็น approved_level2
+    if (leave.status !== 'approved_level2') {
+      return errorResponse(
+        res,
+        HTTP_STATUS.BAD_REQUEST,
+        'This leave request is not ready for head approval'
+      );
+    }
+
+    // คำนวณจำนวนวันที่อนุมัติใหม่
+    const newTotalDays = approvedDates.length;
+    const newStartDate = approvedDates.sort()[0];
+    const newEndDate = approvedDates.sort()[approvedDates.length - 1];
+
+    // อัพเดทข้อมูลการลา
+    const { error: updateError } = await supabaseAdmin
+      .from('leaves')
+      .update({
+        status: 'approved_level3',
+        current_approval_level: 4,
+        total_days: newTotalDays,
+        start_date: newStartDate,
+        end_date: newEndDate,
+        selected_dates: approvedDates,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', id);
+
+    if (updateError) {
+      throw updateError;
+    }
+
+    // สร้างหมายเหตุรวม - รูปแบบกระชับ
+    let fullRemarks = `✓ อนุมัติ: ${approvedDates.join(', ')}`;
+    if (rejectedDates && rejectedDates.length > 0) {
+      fullRemarks += ` | ✗ ไม่อนุมัติ: ${rejectedDates.join(', ')} (เหตุผล: ${rejectReason})`;
+    }
+    if (remarks) {
+      fullRemarks += ` | หมายเหตุ: ${remarks}`;
+    }
+
+    // บันทึกการอนุมัติใน approvals table
+    const { error: approvalError } = await supabaseAdmin
+      .from('approvals')
+      .insert({
+        leave_id: id,
+        approver_id: headId,
+        approval_level: 3,
+        action: 'partial_approved',
+        comment: fullRemarks,
+        action_date: new Date().toISOString()
+      });
+
+    if (approvalError) {
+      console.error('Error inserting approval record:', approvalError);
+    }
+
+    // ส่งแจ้งเตือนให้ผู้ขอลา
+    let notificationMessage = `คำขอลาเลขที่ ${leave.leave_number} ได้รับการอนุมัติบางส่วน: ${approvedDates.length} วัน`;
+    if (rejectedDates && rejectedDates.length > 0) {
+      notificationMessage += ` (ไม่อนุมัติ ${rejectedDates.length} วัน: ${rejectReason})`;
+    }
+
+    await createNotification(
+      leave.user_id,
+      'leave_partial_approved',
+      'คำขอลาได้รับการอนุมัติบางส่วน',
+      notificationMessage,
+      id,
+      'leave'
+    );
+
+    return successResponse(
+      res,
+      HTTP_STATUS.OK,
+      'Leave partially approved successfully',
+      {
+        leaveId: id,
+        status: 'approved_level3',
+        approvedDates,
+        rejectedDates,
+        newTotalDays,
+        nextLevel: 'Admin (Final Approval)'
+      }
+    );
+  } catch (error) {
+    console.error('Partial approve leave (level 3) error:', error);
+    return errorResponse(
+      res,
+      HTTP_STATUS.INTERNAL_SERVER_ERROR,
+      'Failed to partially approve leave'
+    );
+  }
+};
+
+/**
+ * ปฏิเสธคำขอยกเลิก (Head - Level 3)
+ */
+export const rejectCancelLevel3 = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { remarks } = req.body;
+    const headId = req.user.id;
+
+    if (!remarks?.trim()) {
+      return errorResponse(res, HTTP_STATUS.BAD_REQUEST, 'Rejection reason is required');
+    }
+
+    const { data: leave } = await supabaseAdmin
+      .from('leaves')
+      .select('*')
+      .eq('id', id)
+      .eq('status', 'cancel_level2')
+      .single();
+
+    if (!leave) {
+      return errorResponse(res, HTTP_STATUS.NOT_FOUND, 'Cancel request not found');
+    }
+
+    // คืนสถานะกลับเป็น approved_final
+    await supabaseAdmin
+      .from('leaves')
+      .update({ status: 'approved_final', updated_at: new Date().toISOString() })
+      .eq('id', id);
+
+    await supabaseAdmin.from('approvals').insert({
+      leave_id: id,
+      approver_id: headId,
+      approval_level: 3,
+      action: 'cancel_rejected',
+      comment: remarks,
+      action_date: new Date().toISOString()
+    });
+
+    // แจ้งผู้ขอลาว่าคำขอยกเลิกถูกปฏิเสธ
+    await createNotification(
+      leave.user_id,
+      'cancel_rejected',
+      'คำขอยกเลิกการลาถูกปฏิเสธ',
+      `คำขอยกเลิก ${leave.leave_number} ถูกปฏิเสธ: ${remarks}`,
+      id,
+      'leave'
+    );
+
+    // ส่ง email แจ้ง user ว่าคำขอยกเลิกถูกปฏิเสธ
+    EmailService.notifyStatusUpdate(id, 'cancel_rejected', {
+      comment: remarks
+    }).catch(err => {
+      console.error('Email notification (cancel_rejected L3) error:', err.message);
+    });
+
+    return successResponse(res, HTTP_STATUS.OK, 'Cancel request rejected');
+  } catch (error) {
+    console.error('Reject cancel (level 3) error:', error);
+    return errorResponse(res, HTTP_STATUS.INTERNAL_SERVER_ERROR, 'Failed to reject cancel');
+  }
+};
+
+/**
+ * ดูประวัติการตรวจสอบ/อนุมัติ (Staff - Level 2)
+ * แสดงรายการใบลาที่ Staff เคยดำเนินการแล้ว (ทั้งอนุมัติและปฏิเสธ)
+ */
+export const getApprovalHistoryStaff = async (req, res) => {
+  try {
+    const staffId = req.user.id;
+
+    // ดึงรายการที่ Staff คนนี้เคยอนุมัติ/ปฏิเสธ จาก approvals table
+    const { data: approvals, error: approvalsError } = await supabaseAdmin
+      .from('approvals')
+      .select('leave_id, action, comment, action_date')
+      .eq('approver_id', staffId)
+      .eq('approval_level', 2)
+      .order('action_date', { ascending: false });
+
+    if (approvalsError) throw approvalsError;
+
+    if (!approvals || approvals.length === 0) {
+      return successResponse(res, HTTP_STATUS.OK, 'No approval history found', []);
+    }
+
+    const leaveIds = [...new Set(approvals.map(a => a.leave_id))];
+
+    // ดึงข้อมูลใบลา
+    const { data: leaves, error: leavesError } = await supabaseAdmin
+      .from('leaves')
+      .select(`
+        *,
+        leave_types (type_name, type_code),
+        users!leaves_user_id_fkey (
+          id, employee_code, title, first_name, last_name, position, department, phone
+        )
+      `)
+      .in('id', leaveIds)
+      .order('updated_at', { ascending: false });
+
+    if (leavesError) throw leavesError;
+
+    // Map approval info to leaves
+    const approvalMap = {};
+    approvals.forEach(a => {
+      if (!approvalMap[a.leave_id]) approvalMap[a.leave_id] = a;
+    });
+
+    // ดึง approval timeline ทั้งหมดของแต่ละใบลา
+    const { data: allApprovals, error: allApprovalsError } = await supabaseAdmin
+      .from('approvals')
+      .select(`
+        leave_id, approval_level, action, comment, action_date,
+        users!approvals_approver_id_fkey ( title, first_name, last_name, position )
+      `)
+      .in('leave_id', leaveIds)
+      .order('approval_level', { ascending: true });
+
+    if (allApprovalsError) console.error('Error fetching all approvals:', allApprovalsError);
+
+    const approvalsTimelineMap = {};
+    (allApprovals || []).forEach(a => {
+      if (!approvalsTimelineMap[a.leave_id]) approvalsTimelineMap[a.leave_id] = [];
+      approvalsTimelineMap[a.leave_id].push({
+        level: a.approval_level,
+        action: a.action,
+        comment: a.comment,
+        actionDate: a.action_date,
+        approverName: a.users ? `${a.users.title || ''}${a.users.first_name || ''} ${a.users.last_name || ''}` : null,
+        approverPosition: a.users?.position || null
+      });
+    });
+
+    return successResponse(
+      res,
+      HTTP_STATUS.OK,
+      'Staff approval history retrieved successfully',
+      leaves.map(leave => {
+        const reason = parseLeaveReason(leave.reason);
+        const selectedDates = parseSelectedDates(leave.reason, leave.selected_dates);
+
+        const myApproval = approvalMap[leave.id];
+
+        return {
+          id: leave.id,
+          leaveNumber: leave.leave_number,
+          leaveType: leave.leave_types?.type_name || 'N/A',
+          leaveTypeCode: leave.leave_types?.type_code || 'N/A',
+          startDate: leave.start_date,
+          endDate: leave.end_date,
+          totalDays: leave.total_days,
+          reason,
+          selectedDates: selectedDates || [],
+          documentUrl: leave.document_url,
+          status: leave.status,
+          currentApprovalLevel: leave.current_approval_level || 1,
+          contactPhone: leave.contact_phone || null,
+          contactAddress: leave.contact_address || null,
+          cancelledAt: leave.cancelled_at || null,
+          cancelledReason: leave.cancelled_reason || null,
+          createdAt: leave.created_at,
+          updatedAt: leave.updated_at,
+          myAction: myApproval?.action || null,
+          myComment: myApproval?.comment || null,
+          myActionDate: myApproval?.action_date || null,
+          approvalTimeline: approvalsTimelineMap[leave.id] || [],
+          employee: {
+            employeeCode: leave.users?.employee_code,
+            name: `${leave.users?.title || ''}${leave.users?.first_name || ''} ${leave.users?.last_name || ''}`,
+            position: leave.users?.position,
+            department: leave.users?.department || 'N/A',
+            phone: leave.users?.phone
+          }
+        };
+      })
+    );
+  } catch (error) {
+    console.error('Get staff approval history error:', error);
+    return errorResponse(res, HTTP_STATUS.INTERNAL_SERVER_ERROR, 'Failed to retrieve approval history');
+  }
+};
+
+/**
+ * ดูประวัติการอนุมัติ (Head - Level 3)
+ * แสดงรายการใบลาที่ Head เคยดำเนินการแล้ว
+ */
+export const getApprovalHistoryHead = async (req, res) => {
+  try {
+    const headId = req.user.id;
+
+    const { data: approvals, error: approvalsError } = await supabaseAdmin
+      .from('approvals')
+      .select('leave_id, action, comment, action_date')
+      .eq('approver_id', headId)
+      .eq('approval_level', 3)
+      .order('action_date', { ascending: false });
+
+    if (approvalsError) throw approvalsError;
+
+    if (!approvals || approvals.length === 0) {
+      return successResponse(res, HTTP_STATUS.OK, 'No approval history found', []);
+    }
+
+    const leaveIds = [...new Set(approvals.map(a => a.leave_id))];
+
+    const { data: leaves, error: leavesError } = await supabaseAdmin
+      .from('leaves')
+      .select(`
+        *,
+        leave_types (type_name, type_code),
+        users!leaves_user_id_fkey (
+          id, employee_code, title, first_name, last_name, position, department, phone
+        )
+      `)
+      .in('id', leaveIds)
+      .order('updated_at', { ascending: false });
+
+    if (leavesError) throw leavesError;
+
+    const approvalMap = {};
+    approvals.forEach(a => {
+      if (!approvalMap[a.leave_id]) approvalMap[a.leave_id] = a;
+    });
+
+    // ดึง approval timeline ทั้งหมดของแต่ละใบลา
+    const { data: allApprovals, error: allApprovalsError } = await supabaseAdmin
+      .from('approvals')
+      .select(`
+        leave_id, approval_level, action, comment, action_date,
+        users!approvals_approver_id_fkey ( title, first_name, last_name, position )
+      `)
+      .in('leave_id', leaveIds)
+      .order('approval_level', { ascending: true });
+
+    if (allApprovalsError) console.error('Error fetching all approvals:', allApprovalsError);
+
+    const approvalsTimelineMap = {};
+    (allApprovals || []).forEach(a => {
+      if (!approvalsTimelineMap[a.leave_id]) approvalsTimelineMap[a.leave_id] = [];
+      approvalsTimelineMap[a.leave_id].push({
+        level: a.approval_level,
+        action: a.action,
+        comment: a.comment,
+        actionDate: a.action_date,
+        approverName: a.users ? `${a.users.title || ''}${a.users.first_name || ''} ${a.users.last_name || ''}` : null,
+        approverPosition: a.users?.position || null
+      });
+    });
+
+    return successResponse(
+      res,
+      HTTP_STATUS.OK,
+      'Head approval history retrieved successfully',
+      leaves.map(leave => {
+        const reason = parseLeaveReason(leave.reason);
+        const selectedDates = parseSelectedDates(leave.reason, leave.selected_dates);
+
+        const myApproval = approvalMap[leave.id];
+
+        return {
+          id: leave.id,
+          leaveNumber: leave.leave_number,
+          leaveType: leave.leave_types?.type_name || 'N/A',
+          leaveTypeCode: leave.leave_types?.type_code || 'N/A',
+          startDate: leave.start_date,
+          endDate: leave.end_date,
+          totalDays: leave.total_days,
+          reason,
+          selectedDates: selectedDates || [],
+          documentUrl: leave.document_url,
+          status: leave.status,
+          currentApprovalLevel: leave.current_approval_level || 1,
+          contactPhone: leave.contact_phone || null,
+          contactAddress: leave.contact_address || null,
+          cancelledAt: leave.cancelled_at || null,
+          cancelledReason: leave.cancelled_reason || null,
+          createdAt: leave.created_at,
+          updatedAt: leave.updated_at,
+          myAction: myApproval?.action || null,
+          myComment: myApproval?.comment || null,
+          myActionDate: myApproval?.action_date || null,
+          approvalTimeline: approvalsTimelineMap[leave.id] || [],
+          employee: {
+            employeeCode: leave.users?.employee_code,
+            name: `${leave.users?.title || ''}${leave.users?.first_name || ''} ${leave.users?.last_name || ''}`,
+            position: leave.users?.position,
+            department: leave.users?.department || 'N/A',
+            phone: leave.users?.phone
+          }
+        };
+      })
+    );
+  } catch (error) {
+    console.error('Get head approval history error:', error);
+    return errorResponse(res, HTTP_STATUS.INTERNAL_SERVER_ERROR, 'Failed to retrieve approval history');
+  }
+};
