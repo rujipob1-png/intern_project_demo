@@ -371,8 +371,7 @@ export const LoginPage = () => {
               </Button>
             </form>
 
-            {/* Demo Accounts - เฉพาะ Development Mode เท่านั้น */}
-            {import.meta.env.DEV && (
+            {/* Demo Accounts */}
             <div className="mt-10 pt-8 border-t border-gray-100 login-slide-up login-slide-up-delay-3">
               <div className="flex items-center justify-between mb-4">
                 <div className="flex items-center gap-2">
@@ -422,7 +421,6 @@ export const LoginPage = () => {
                 กลุ่มงาน: กยส., กทส., กอก., กตป., กสส., กคฐ.
               </p>
             </div>
-            )}
           </div>
         </div>
 
